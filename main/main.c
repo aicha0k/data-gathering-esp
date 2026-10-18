@@ -6,6 +6,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <stddef.h>
+#include <math.h>
 
 #define SAMPLE_RATE 16000
 #define CHANNELS 1
@@ -16,7 +17,7 @@
 #define MIC_CLK GPIO_NUM_42
 #define MIC_DATA GPIO_NUM_41
 
-static const char *TAG = "microphome_config";
+static const char *TAG = "microphone_config";
 
 static i2s_chan_handle_t rx_channel;
 
@@ -58,36 +59,89 @@ void app_main(void)
     // enabling the microphone channel to start receiving data
     ESP_ERROR_CHECK(i2s_channel_enable(rx_channel));
     ESP_LOGI(TAG, "Microphone initialized successfully. ");
-    vTaskDelay(pdMS_TO_TICKS(1000));
 
-    ESP_LOGI(TAG, "Starting audio recording for %d seconds...", RECORDING_DURATION);
+    ESP_LOGI(TAG, "Starting audio recording for %d seconds...\n", RECORDING_DURATION);
     int16_t audio_buffer[BUFFER_SAMPLES]; // int16_t occupies 2 bytes, our buffer is 512 bytes long, which is enough to hold 256 samples of 16-bit audio data.
 
-    for (int i = 0; i < 5; i++)
+    uint32_t samples_recorded = 0;
+    const uint32_t target_samples = SAMPLE_RATE * RECORDING_DURATION; // total number of samples to record . 48000 samples for 3 seconds at 16kHz
+
+    int16_t min_sample = INT16_MAX;
+    int16_t max_sample = INT16_MIN;
+
+    double sum = 0;
+    double sum_squares = 0;
+
+    while (samples_recorded < target_samples)
     {
         size_t bytes_read = 0;
 
         esp_err_t ret = i2s_channel_read(
             rx_channel,
-            audio_buffer,         // memory where samples will be copied
-            sizeof(audio_buffer), // buffer capacity in bytes
-            &bytes_read,          // where the driver will write how many bytes were actually read
-            1000);                // timeout in milliseconds
+            audio_buffer,
+            sizeof(audio_buffer), // 512 bytes, enough to hold 256 samples of 16-bit audio data
+            &bytes_read,
+            1000);
+
         if (ret != ESP_OK)
         {
-            ESP_LOGE(TAG, "Error reading from microphone: %s", esp_err_to_name(ret));
+            ESP_LOGE(TAG, "I2S read failed: %s",
+                     esp_err_to_name(ret));
             break;
         }
-        size_t samples_read = bytes_read / (BITS_PER_SAMPLE / 8); // convert bytes to samples
-        ESP_LOGI(TAG, "Read %d samples from microphone", (unsigned)samples_read);
-        size_t samples_to_print = samples_read < 10 ? samples_read : 10; // print only the first 10 samples
-        for (size_t j = 0; j < samples_to_print; j++)
+
+        size_t samples_read = bytes_read / sizeof(int16_t);
+
+        if (samples_read == 0)
         {
-            printf("%d ", (int)audio_buffer[j]);
+            continue;
         }
-        printf("\n");
-        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        // Never process beyond the requested sample count
+        uint32_t remaining = target_samples - samples_recorded;
+
+        if (samples_read > remaining)
+        {
+            samples_read = remaining;
+        }
+
+        for (size_t j = 0; j < samples_read; j++)
+        {
+            int16_t sample = audio_buffer[j];
+
+            if (sample < min_sample)
+                min_sample = sample;
+
+            if (sample > max_sample)
+                max_sample = sample;
+
+            sum += sample;
+            sum_squares += (double)sample * sample;
+        }
+
+        samples_recorded += samples_read;
     }
+
+    if (samples_recorded > 0)
+    {
+        double mean = sum / samples_recorded;
+
+        double rms = sqrt(sum_squares / samples_recorded);
+
+        double ac_rms = sqrt(
+            fmax(0.0,
+                 sum_squares / samples_recorded - mean * mean));
+
+        ESP_LOGI(TAG, "Recording statistics:");
+        ESP_LOGI(TAG, "Samples recorded: %lu",
+                 (unsigned long)samples_recorded);
+        ESP_LOGI(TAG, "Min:    %d", min_sample);
+        ESP_LOGI(TAG, "Max:    %d", max_sample);
+        ESP_LOGI(TAG, "Mean:   %.2f", mean);
+        ESP_LOGI(TAG, "RMS:    %.2f", rms);
+        ESP_LOGI(TAG, "AC RMS: %.2f", ac_rms);
+    }
+
     // Release driver resources after the test
     ESP_ERROR_CHECK(i2s_channel_disable(rx_channel));
     ESP_ERROR_CHECK(i2s_del_channel(rx_channel));
