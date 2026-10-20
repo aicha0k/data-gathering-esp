@@ -11,11 +11,14 @@
 #include "driver/sdspi_host.h"
 #include "esp_vfs_fat.h"
 #include "sdmmc_cmd.h"
+#include <stdbool.h>
+#include <sys/stat.h>
+#include <errno.h>
 
 #define SAMPLE_RATE 16000
 #define CHANNELS 1
 #define BITS_PER_SAMPLE 16
-#define RECORDING_DURATION 3 // seconds
+#define RECORDING_DURATION 30 // seconds
 #define BUFFER_SAMPLES 256
 
 #define MIC_CLK GPIO_NUM_42
@@ -28,9 +31,95 @@
 
 #define MOUNT_POINT "/sdcard"
 
+#define MAX_RECORDINGS 100
+
 static const char *TAG = "microphone_config";
 
 static i2s_chan_handle_t rx_channel;
+
+typedef struct __attribute__((packed))
+{
+    char riff[4];
+    uint32_t chunk_size;
+    char wave[4];
+
+    char fmt[4];
+    uint32_t subchunk1_size;
+    uint16_t audio_format;
+    uint16_t num_channels;
+    uint32_t sample_rate;
+    uint32_t byte_rate;
+    uint16_t block_align;
+    uint16_t bits_per_sample;
+
+    char data[4];
+    uint32_t data_size;
+
+} wav_header_t;
+
+static bool generate_filename(char *filename, size_t size);
+static bool write_wav_header(FILE *file, uint32_t data_size);
+
+static bool generate_filename(char *filename, size_t size)
+{
+    struct stat file_info;
+
+    for (int i = 1; i <= MAX_RECORDINGS; i++)
+    {
+        int length = snprintf(
+            filename,
+            size,
+            "/sdcard/recording_%03d.wav",
+            i
+        );
+
+        if (length < 0 || (size_t)length >= size)
+        {
+            return false;
+        }
+
+        if (stat(filename, &file_info) != 0)
+        {
+            if (errno == ENOENT)
+            {
+                return true;
+            }
+
+            // Unexpected filesystem error
+            ESP_LOGE(TAG, "File check failed: errno=%d", errno);
+            return false;
+        }
+    }
+
+    return false;
+}
+
+static bool write_wav_header(FILE *file, uint32_t data_size)
+{
+    wav_header_t header = {
+        .riff = {'R', 'I', 'F', 'F'},
+        .chunk_size = 36 + data_size,
+        .wave = {'W', 'A', 'V', 'E'},
+
+        .fmt = {'f', 'm', 't', ' '},
+        .subchunk1_size = 16,
+        .audio_format = 1,
+        .num_channels = CHANNELS,
+        .sample_rate = SAMPLE_RATE,
+
+        .byte_rate = SAMPLE_RATE * CHANNELS *
+                     (BITS_PER_SAMPLE / 8),
+
+        .block_align = CHANNELS * (BITS_PER_SAMPLE / 8),
+        .bits_per_sample = BITS_PER_SAMPLE,
+
+        .data = {'d', 'a', 't', 'a'},
+        .data_size = data_size};
+
+    return fwrite(&header, sizeof(header), 1, file) == 1;
+}
+
+
 
 void app_main(void)
 {
@@ -90,7 +179,26 @@ void app_main(void)
     ESP_LOGI(TAG, " Total samples per channel: %lu", total_samples);
     ESP_LOGI(TAG, " Total bytes for recording: %lu", total_bytes);
 
-    FILE *file = fopen("/sdcard/recording.pcm", "wb");
+    // FILE *file = fopen("/sdcard/recording.wav", "wb");
+    char filename[64];
+    if(!generate_filename(filename, sizeof(filename)))
+    {
+        ESP_LOGE(TAG, "Failed to generate a filename");
+        esp_vfs_fat_sdcard_unmount(MOUNT_POINT, card);
+        spi_bus_free(host.slot);
+        return;
+    }
+    ESP_LOGI(TAG, "Recording will be saved to: %s", filename);
+    FILE *file = fopen(filename, "wb");
+
+    if (!write_wav_header(file, 0))
+    {
+        ESP_LOGE(TAG, "Failed to write WAV header");
+        fclose(file);
+        esp_vfs_fat_sdcard_unmount(MOUNT_POINT, card);
+        spi_bus_free(host.slot);
+        return;
+    }
 
     if (file == NULL)
     {
@@ -206,6 +314,16 @@ void app_main(void)
 
         samples_recorded += samples_written;
     }
+    uint32_t data_bytes = samples_recorded * sizeof(int16_t);
+
+    if (fseek(file, 0, SEEK_SET) != 0) // This moves the current file position back to byte zero, the beginning of the WAV file.
+    {
+        ESP_LOGE(TAG, "Failed to seek to WAV header");
+    }
+    else if (!write_wav_header(file, data_bytes))
+    {
+        ESP_LOGE(TAG, "Failed to finalize WAV header");
+    }
 
     if (fclose(file) != 0)
     {
@@ -221,5 +339,5 @@ void app_main(void)
     ESP_ERROR_CHECK(i2s_del_channel(rx_channel));
 
     esp_vfs_fat_sdcard_unmount(MOUNT_POINT, card);
-    spi_bus_free(host.slot);
+    ESP_ERROR_CHECK(spi_bus_free(host.slot));
 }
